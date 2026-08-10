@@ -216,6 +216,16 @@ class LIP:
             raise
 
         # set the correct monitoring
+        await self._async_setup_monitoring()
+
+    async def _async_setup_monitoring(self):
+        """Subscribe to the unsolicited updates we care about.
+
+        Monitoring is session scoped, so this has to be re-issued after every
+        reconnect -- not just on the initial connect. Without it the socket is
+        healthy and outgoing commands still work, but the bridge never pushes
+        state changes back and every entity goes stale.
+        """
         await self.action(LIPMode.MONITORING, 12, 2)  # disable prompt state
         await self.action(
             LIPMode.MONITORING, 255, 2
@@ -278,20 +288,44 @@ class LIP:
             self._socket = None
 
         self._reconnecting_event.set()
-        async with self._read_connect_lock:
-            self.connection_state = LIPConnectionState.NOT_CONNECTED
-            while not self._disconnect_event.is_set():
-                try:
-                    await self._async_connect(self._host)
-                except (TimeoutError, OSError):
-                    _LOGGER.debug(
-                        "Timed out while trying to reconnect to %s", self._host
+        try:
+            async with self._read_connect_lock:
+                self.connection_state = LIPConnectionState.NOT_CONNECTED
+                while not self._disconnect_event.is_set():
+                    try:
+                        await self._async_connect(self._host)
+                        await self._async_setup_monitoring()
+                    except Exception as ex:  # noqa: BLE001
+                        # Deliberately broad. This retry loop is the only thing
+                        # that can bring the link back, so nothing may escape
+                        # it: an escaping exception leaves _reconnecting_event
+                        # set forever, and the guard at the top of this method
+                        # then makes every future reconnect a no-op while
+                        # connection_state stays CONNECTING -- the integration
+                        # wedges until it is reloaded by hand. A bridge that
+                        # garbles its login banner mid-handshake raises
+                        # LIPProtocolError here, which is not an OSError.
+                        _LOGGER.debug("Reconnect to %s failed: %s", self._host, ex)
+                        # _async_connect leaves the state at CONNECTING and the
+                        # half-open socket assigned when it raises part-way
+                        # through; clean both up or we leak a session on the
+                        # bridge with every attempt.
+                        if self._socket:
+                            self._socket.close()
+                            self._socket = None
+                        self.connection_state = LIPConnectionState.NOT_CONNECTED
+                        await asyncio.sleep(RECONNECT_DELAY)
+                        continue
+
+                    _LOGGER.info(
+                        "Restored monitoring after reconnect to %s", self._host
                     )
-                    # Back-off a bit before the next reconnect attempt to avoid a busy loop.
-                    await asyncio.sleep(RECONNECT_DELAY)
-                else:
                     self._keepalive_watchdog()
                     return
+        finally:
+            # Belt and braces: _async_connect clears this on success, but if we
+            # leave by any other route it must not stay set.
+            self._reconnecting_event.clear()
 
     async def async_stop(self):
         """Disconnect from the bridge."""
@@ -332,6 +366,15 @@ class LIP:
             or self.connection_state != LIPConnectionState.CONNECTED
         ):
             return
+
+        # Drop any still-pending timer first. Every reconnect calls back into
+        # this method, and without this each one starts an additional
+        # self-rescheduling chain -- N reconnects means N keep-alives a minute
+        # against a bridge that is already struggling. Cancelling an
+        # already-fired handle (the self-rescheduling case) is a no-op.
+        if self._keep_alive_task:
+            self._keep_alive_task.cancel()
+            self._keep_alive_task = None
 
         self._keep_alive_reconnect_task = asyncio.create_task(
             self._async_keep_alive_or_reconnect()
@@ -385,6 +428,14 @@ class LIP:
             return
         except (asyncio.InvalidStateError, BrokenPipeError) as ex:
             _LOGGER.debug("Error processing message", exc_info=ex)
+            return
+        except OSError as ex:
+            # The bridge reset the socket mid-read. Without this the exception
+            # escapes async_run(), killing the reader task for good: outgoing
+            # commands keep working (they reconnect on demand) but no state
+            # update is ever read again. Reconnect and let async_run() loop.
+            _LOGGER.info("Lutron connection lost while reading (%s), reconnecting", ex)
+            await self._async_disconnected()
             return
 
     def _process_message(self, response):
